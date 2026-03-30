@@ -1,0 +1,5 @@
+{
+  "name": "ECWBCE: Evolutionary Web-Book Creator",
+  "description": "An Evolutionary Computing-driven Web-Book Creation Engine that autonomously synthesizes topic-specific knowledge from distributed Web resources using Genetic Algorithms.",
+  "requestFramePermissions": []
+}
