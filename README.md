@@ -4,6 +4,8 @@
 
 ECWBCE is an autonomous knowledge synthesis engine that transforms a simple search query into a comprehensive, hierarchically organized "Web-Book." It leverages Genetic Algorithms (GA) to evolve the most informative collection of web sources and organizes them into a navigable digital book complete with AI-generated illustrations.
 
+👉 The live application is available at: https://aistudio.google.com/apps/668e2c29-2a5b-46cb-ada1-10d82255f10f?showPreview=true&showAssistant=true
+
 ---
 
 ## 📖 Table of Contents
