@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect, useRef } from "react";
-import { Search, Book, Loader2, ChevronRight, ExternalLink, Info, Award, Layers, Sparkles, Trash2, History, Plus, Image as ImageIcon } from "lucide-react";
+import { Search, Book, Loader2, ExternalLink, Info, Award, Layers, Sparkles, Trash2, History, Plus } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { GoogleGenAI, Type } from "@google/genai";
 import { kmeans } from "ml-kmeans";
@@ -36,6 +36,13 @@ interface Page {
   summary: string;
 }
 
+interface FitnessMetrics {
+  definitionalDensity: number;
+  semanticCoherence: number;
+  topicalAuthority: number;
+  contentNovelty: number;
+}
+
 interface Section {
   title: string;
   pages: Page[];
@@ -48,6 +55,7 @@ interface WebBook {
   query: string;
   sections: Section[];
   coverImageUrl?: string;
+  metrics?: FitnessMetrics;
   timestamp: number;
 }
 
@@ -65,6 +73,25 @@ const DEFAULT_CONFIG: GAConfig = {
     nov: 0.15,
   },
 };
+
+const PDF_COLORS = {
+  ink: [20, 20, 20] as const,
+  muted: [92, 92, 92] as const,
+  accent: [224, 120, 55] as const,
+};
+
+function getBookDisplayTitle(title: string): string {
+  return title.replace(/^Web-Book:\s*/i, "").trim() || title;
+}
+
+function createPdfFileName(book: WebBook): string {
+  const base = getBookDisplayTitle(book.title)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return `${base || "web-book"}.pdf`;
+}
 
 // --- Simple NLP Utilities ---
 function tokenize(text: string): string[] {
@@ -142,6 +169,325 @@ function calculateDefinitionalDensity(content: string): number {
   return wordCount > 0 ? count / wordCount : 0;
 }
 
+function calculateFitnessMetrics(selectedPages: WebPage[]): FitnessMetrics {
+  if (selectedPages.length === 0) {
+    return {
+      definitionalDensity: 0,
+      semanticCoherence: 0,
+      topicalAuthority: 0,
+      contentNovelty: 0,
+    };
+  }
+
+  const definitionalDensity =
+    selectedPages.reduce((acc, page) => acc + calculateDefinitionalDensity(page.content), 0) / selectedPages.length;
+
+  let semanticCoherence = 0.5;
+  if (selectedPages.length > 1) {
+    let sumSim = 0;
+    let pairs = 0;
+    for (let i = 0; i < selectedPages.length; i++) {
+      for (let j = i + 1; j < selectedPages.length; j++) {
+        sumSim += cosineSimilarity(selectedPages[i].tfidfVector!, selectedPages[j].tfidfVector!);
+        pairs++;
+      }
+    }
+    semanticCoherence = pairs > 0 ? sumSim / pairs : 0.5;
+  }
+
+  const topicalAuthority =
+    selectedPages.reduce((acc, page) => acc + 1 / (page.rank + 1), 0) / selectedPages.length;
+
+  let contentNovelty = 1;
+  if (selectedPages.length > 1) {
+    let sumSim = 0;
+    let pairs = 0;
+    for (let i = 0; i < selectedPages.length; i++) {
+      for (let j = i + 1; j < selectedPages.length; j++) {
+        const s1 = new Set(selectedPages[i].topTerms ?? []);
+        const s2 = new Set(selectedPages[j].topTerms ?? []);
+        sumSim += jaccardSimilarity(s1, s2);
+        pairs++;
+      }
+    }
+    contentNovelty = pairs > 0 ? 1 - sumSim / pairs : 1;
+  }
+
+  return {
+    definitionalDensity,
+    semanticCoherence,
+    topicalAuthority,
+    contentNovelty,
+  };
+}
+
+function calculateWeightedFitness(metrics: FitnessMetrics, weights: GAConfig["weights"]): number {
+  return (
+    weights.def * metrics.definitionalDensity +
+    weights.sem * metrics.semanticCoherence +
+    weights.auth * metrics.topicalAuthority +
+    weights.nov * metrics.contentNovelty
+  );
+}
+
+async function exportBookAsPdf(book: WebBook) {
+  const { jsPDF } = await import("jspdf");
+  const doc = new jsPDF({
+    orientation: "portrait",
+    unit: "pt",
+    format: "a4",
+    compress: true,
+    putOnlyUsedFonts: true,
+  });
+
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const margin = 52;
+  const contentWidth = pageWidth - margin * 2;
+  const footerHeight = 28;
+  const state = {
+    cursorY: margin,
+  };
+  const sourceCount = book.sections.reduce((count, section) => count + section.pages.length, 0);
+
+  const setTextColor = (color: readonly [number, number, number]) => {
+    doc.setTextColor(color[0], color[1], color[2]);
+  };
+
+  const startNewPage = () => {
+    doc.addPage();
+    state.cursorY = margin;
+  };
+
+  const ensureSpace = (height: number) => {
+    if (state.cursorY + height <= pageHeight - margin - footerHeight) {
+      return;
+    }
+    startNewPage();
+  };
+
+  const addRule = (spacingBefore = 14, spacingAfter = 14) => {
+    state.cursorY += spacingBefore;
+    ensureSpace(2 + spacingAfter);
+    doc.setDrawColor(PDF_COLORS.ink[0], PDF_COLORS.ink[1], PDF_COLORS.ink[2]);
+    doc.setLineWidth(1);
+    doc.line(margin, state.cursorY, pageWidth - margin, state.cursorY);
+    state.cursorY += spacingAfter;
+  };
+
+  const addParagraph = (
+    text: string,
+    options?: {
+      fontSize?: number;
+      color?: readonly [number, number, number];
+      indent?: number;
+      lineHeight?: number;
+      gapAfter?: number;
+      maxWidth?: number;
+      style?: "normal" | "bold" | "italic" | "bolditalic";
+    },
+  ) => {
+    const fontSize = options?.fontSize ?? 11;
+    const indent = options?.indent ?? 0;
+    const maxWidth = options?.maxWidth ?? contentWidth - indent;
+    const lineHeight = options?.lineHeight ?? fontSize * 1.45;
+    const lines = doc.splitTextToSize(text, maxWidth);
+
+    doc.setFont("helvetica", options?.style ?? "normal");
+    doc.setFontSize(fontSize);
+    setTextColor(options?.color ?? PDF_COLORS.ink);
+
+    for (const line of lines) {
+      ensureSpace(lineHeight);
+      doc.text(line, margin + indent, state.cursorY);
+      state.cursorY += lineHeight;
+    }
+
+    state.cursorY += options?.gapAfter ?? 0;
+  };
+
+  const addLinkedUrl = (url: string) => {
+    const fontSize = 10;
+    const lineHeight = fontSize * 1.45;
+    const lines = doc.splitTextToSize(url, contentWidth);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(fontSize);
+    setTextColor(PDF_COLORS.accent);
+
+    for (const line of lines) {
+      ensureSpace(lineHeight);
+      doc.textWithLink(line, margin, state.cursorY, { url });
+      state.cursorY += lineHeight;
+    }
+  };
+
+  const addImageBlock = (dataUrl: string, maxHeight: number) => {
+    const props = doc.getImageProperties(dataUrl);
+    const scale = Math.min(contentWidth / props.width, maxHeight / props.height);
+    const width = props.width * scale;
+    const height = props.height * scale;
+
+    ensureSpace(height + 12);
+    doc.addImage(dataUrl, props.fileType || "PNG", margin, state.cursorY, width, height);
+    state.cursorY += height + 12;
+  };
+
+  const addSourceCard = (page: Page, index: number) => {
+    addParagraph(`${index}. ${page.title}`, {
+      fontSize: 13,
+      style: "bold",
+      gapAfter: 4,
+    });
+    addLinkedUrl(page.url);
+    addParagraph(page.summary, {
+      color: PDF_COLORS.muted,
+      gapAfter: 10,
+    });
+    addRule(0, 12);
+  };
+
+  const addFooter = (pageIndex: number, totalPages: number) => {
+    doc.setPage(pageIndex);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    setTextColor(PDF_COLORS.muted);
+    doc.text(getBookDisplayTitle(book.title), margin, pageHeight - 16);
+    doc.text(`${pageIndex} / ${totalPages}`, pageWidth - margin, pageHeight - 16, { align: "right" });
+  };
+
+  doc.setProperties({
+    title: book.title,
+    subject: `Exported web-book for ${book.query}`,
+    author: "ECWBCE",
+    creator: "ECWBCE",
+    keywords: "web-book, evolutionary computing, gemini, pdf export",
+  });
+
+  setTextColor(PDF_COLORS.muted);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(11);
+  doc.text("ECWBCE / Evolutionary Web-Book Creator", margin, state.cursorY);
+  state.cursorY += 26;
+
+  addParagraph(getBookDisplayTitle(book.title), {
+    fontSize: 26,
+    style: "bold",
+    lineHeight: 30,
+    gapAfter: 6,
+  });
+  addParagraph(
+    `${book.sections.length} sections / ${sourceCount} curated sources / ${new Date(book.timestamp).toLocaleString()}`,
+    {
+      fontSize: 11,
+      color: PDF_COLORS.muted,
+      gapAfter: 18,
+    },
+  );
+
+  if (book.coverImageUrl) {
+    addImageBlock(book.coverImageUrl, 250);
+  }
+
+  addParagraph(
+    "This PDF is generated directly from the current in-app web-book so it stays independent of the surrounding AI Studio shell and browser print behavior.",
+    {
+      fontSize: 11,
+      color: PDF_COLORS.muted,
+      gapAfter: 14,
+    },
+  );
+
+  if (book.metrics) {
+    addRule(0, 16);
+    addParagraph("Selection metrics", {
+      fontSize: 16,
+      style: "bold",
+      gapAfter: 10,
+    });
+    addParagraph(`Definitional density: ${book.metrics.definitionalDensity.toFixed(3)}`, {
+      fontSize: 11,
+      gapAfter: 2,
+    });
+    addParagraph(`Semantic coherence: ${book.metrics.semanticCoherence.toFixed(3)}`, {
+      fontSize: 11,
+      gapAfter: 2,
+    });
+    addParagraph(`Topical authority: ${book.metrics.topicalAuthority.toFixed(3)}`, {
+      fontSize: 11,
+      gapAfter: 2,
+    });
+    addParagraph(`Content novelty: ${book.metrics.contentNovelty.toFixed(3)}`, {
+      fontSize: 11,
+      gapAfter: 8,
+    });
+  }
+
+  addRule(0, 16);
+  addParagraph("Table of contents", {
+    fontSize: 16,
+    style: "bold",
+    gapAfter: 10,
+  });
+
+  book.sections.forEach((section, index) => {
+    addParagraph(
+      `${String(index + 1).padStart(2, "0")}. ${section.title} (${section.pages.length} sources)`,
+      {
+        fontSize: 12,
+        gapAfter: 4,
+      },
+    );
+  });
+
+  book.sections.forEach((section, sectionIndex) => {
+    startNewPage();
+
+    addParagraph(`Section ${String(sectionIndex + 1).padStart(2, "0")}`, {
+      fontSize: 10,
+      color: PDF_COLORS.muted,
+      gapAfter: 8,
+    });
+    addParagraph(section.title, {
+      fontSize: 22,
+      style: "bold",
+      lineHeight: 26,
+      gapAfter: 12,
+    });
+
+    if (section.imageUrl) {
+      addImageBlock(section.imageUrl, 170);
+    }
+
+    addParagraph(`${section.pages.length} source summaries`, {
+      fontSize: 11,
+      color: PDF_COLORS.muted,
+      gapAfter: 10,
+    });
+    addRule(0, 12);
+
+    section.pages.forEach((page, pageIndex) => {
+      addSourceCard(page, pageIndex + 1);
+    });
+  });
+
+  const totalPages = doc.getNumberOfPages();
+  for (let pageIndex = 1; pageIndex <= totalPages; pageIndex += 1) {
+    addFooter(pageIndex, totalPages);
+  }
+
+  const blob = doc.output("blob");
+  const downloadUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = downloadUrl;
+  link.download = createPdfFileName(book);
+  link.target = "_blank";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+}
+
 // --- GA Engine ---
 class GAEngine {
   population: boolean[][] = [];
@@ -168,45 +514,7 @@ class GAEngine {
     const selectedIndices = chromosome.map((val, idx) => val ? idx : -1).filter(idx => idx !== -1);
     if (selectedIndices.length === 0) return 0;
     const selectedPages = selectedIndices.map(idx => this.frontier[idx]);
-
-    const f_def = selectedPages.reduce((acc, p) => acc + calculateDefinitionalDensity(p.content), 0) / selectedPages.length;
-    
-    let f_sem = 0;
-    if (selectedPages.length > 1) {
-      let sumSim = 0;
-      let pairs = 0;
-      for (let i = 0; i < selectedPages.length; i++) {
-        for (let j = i + 1; j < selectedPages.length; j++) {
-          sumSim += cosineSimilarity(selectedPages[i].tfidfVector!, selectedPages[j].tfidfVector!);
-          pairs++;
-        }
-      }
-      f_sem = sumSim / pairs;
-    } else f_sem = 0.5;
-
-    const f_auth = selectedPages.reduce((acc, p) => acc + (1 / (p.rank + 1)), 0) / selectedPages.length;
-
-    let f_nov = 1;
-    if (selectedPages.length > 1) {
-      let sumSim = 0;
-      let pairs = 0;
-      for (let i = 0; i < selectedPages.length; i++) {
-        for (let j = i + 1; j < selectedPages.length; j++) {
-          const s1 = new Set(selectedPages[i].topTerms);
-          const s2 = new Set(selectedPages[j].topTerms);
-          sumSim += jaccardSimilarity(s1, s2);
-          pairs++;
-        }
-      }
-      f_nov = 1 - (sumSim / pairs);
-    }
-
-    return (
-      this.config.weights.def * f_def +
-      this.config.weights.sem * f_sem +
-      this.config.weights.auth * f_auth +
-      this.config.weights.nov * f_nov
-    );
+    return calculateWeightedFitness(calculateFitnessMetrics(selectedPages), this.config.weights);
   }
 
   evolve(onProgress: (gen: number) => void) {
@@ -265,6 +573,7 @@ class GAEngine {
 export default function App() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  const [exportingPdf, setExportingPdf] = useState(false);
   const [book, setBook] = useState<WebBook | null>(null);
   const [history, setHistory] = useState<WebBook[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -314,17 +623,23 @@ export default function App() {
     return undefined;
   };
 
-  // Keyboard shortcut for search
+  // Keyboard shortcuts for search and export
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "/" && document.activeElement?.tagName !== "TEXTAREA" && document.activeElement?.tagName !== "INPUT") {
         e.preventDefault();
         textareaRef.current?.focus();
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "e" && book && !loading && !exportingPdf) {
+        e.preventDefault();
+        void handleExportPdf();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  }, [book, exportingPdf, loading]);
 
   const handleSynthesize = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -387,6 +702,7 @@ export default function App() {
       const engine = new GAEngine(frontier);
       const bestChromosome = engine.evolve((g) => setGen(g));
       const selectedPages = frontier.filter((_, i) => bestChromosome[i]);
+      const metrics = calculateFitnessMetrics(selectedPages);
 
       setStatus("Hierarchical Knowledge Organization...");
       if (selectedPages.length === 0) throw new Error("GA failed to select any informative pages.");
@@ -400,6 +716,7 @@ export default function App() {
         title: `Web-Book: ${query}`,
         query: query,
         sections: [],
+        metrics,
         timestamp: Date.now()
       };
 
@@ -459,6 +776,21 @@ export default function App() {
   const clearHistory = () => {
     setHistory([]);
     setBook(null);
+  };
+
+  const handleExportPdf = async () => {
+    if (!book) return;
+
+    setExportingPdf(true);
+    setError(null);
+
+    try {
+      await exportBookAsPdf(book);
+    } catch (err: any) {
+      setError(err?.message || "Failed to export the current web-book as a PDF.");
+    } finally {
+      setExportingPdf(false);
+    }
   };
 
   return (
@@ -683,7 +1015,7 @@ export default function App() {
         {/* Error State */}
         {error && (
           <div className="max-w-xl mx-auto p-6 border border-red-500/30 bg-red-500/5 rounded-lg text-red-600 mb-12">
-            <h3 className="font-bold mb-2">Synthesis Error</h3>
+            <h3 className="font-bold mb-2">Operation Error</h3>
             <p className="text-sm opacity-80">{error}</p>
           </div>
         )}
@@ -719,19 +1051,19 @@ export default function App() {
                     <div className="space-y-3 text-[11px] font-mono opacity-80">
                       <div className="flex justify-between">
                         <span>Definitional Density</span>
-                        <span>0.84</span>
+                        <span>{book.metrics ? book.metrics.definitionalDensity.toFixed(3) : "N/A"}</span>
                       </div>
                       <div className="flex justify-between">
                         <span>Semantic Coherence</span>
-                        <span>0.79</span>
+                        <span>{book.metrics ? book.metrics.semanticCoherence.toFixed(3) : "N/A"}</span>
                       </div>
                       <div className="flex justify-between">
                         <span>Topical Authority</span>
-                        <span>0.92</span>
+                        <span>{book.metrics ? book.metrics.topicalAuthority.toFixed(3) : "N/A"}</span>
                       </div>
                       <div className="flex justify-between">
                         <span>Content Novelty</span>
-                        <span>0.88</span>
+                        <span>{book.metrics ? book.metrics.contentNovelty.toFixed(3) : "N/A"}</span>
                       </div>
                     </div>
                   </div>
